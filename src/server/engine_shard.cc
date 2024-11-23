@@ -198,6 +198,11 @@ optional<uint32_t> GetPeriodicCycleMs() {
   return clock_cycle_ms;
 }
 
+template <typename From, typename To>
+To ConvertNumericOrRound(From value, From max = std::numeric_limits<To>::max()) {
+  return static_cast<To>(std::min(value, max));
+}
+
 }  // namespace
 
 __thread EngineShard* EngineShard::shard_ = nullptr;
@@ -703,6 +708,7 @@ void EngineShard::RetireExpiredAndEvict() {
   { std::unique_lock lk(db_slice.GetSerializationMutex()); }
   constexpr double kTtlDeleteLimit = 200;
   constexpr double kRedLimitFactor = 0.1;
+  constexpr double kRedLimitFactorRev = 1.0 - kRedLimitFactor;
 
   uint32_t traversed = GetMovingSum6(TTL_TRAVERSE);
   uint32_t deleted = GetMovingSum6(TTL_DELETE);
@@ -716,8 +722,17 @@ void EngineShard::RetireExpiredAndEvict() {
     ttl_delete_target = kTtlDeleteLimit * double(deleted) / (double(traversed) + 10);
   }
 
-  ssize_t eviction_redline = size_t(max_memory_limit * kRedLimitFactor) / shard_set->size();
+  const size_t max_rss_memory =
+      max_memory_limit * std::max(ServerState::tlocal()->rss_oom_deny_ratio, 0.0);
+  const ssize_t rss_memory =
+      ConvertNumericOrRound<uint64_t, ssize_t>(rss_mem_current.load(memory_order_relaxed));
 
+  // For memory we are using threshold for free memory
+  const ssize_t memory_budget_threshold =
+      ssize_t(max_memory_limit * kRedLimitFactor) / shard_set->size();
+  // For rss we are using threshold for used memory
+  const ssize_t rss_memory_threshold =
+      ssize_t(max_rss_memory * kRedLimitFactorRev) / shard_set->size();
   DbContext db_cntx;
   db_cntx.time_now_ms = GetCurrentTimeMs();
 
@@ -735,10 +750,12 @@ void EngineShard::RetireExpiredAndEvict() {
     }
 
     // if our budget is below the limit
-    if (db_slice.memory_budget() < eviction_redline && GetFlag(FLAGS_enable_heartbeat_eviction)) {
+    if ((db_slice.memory_budget() < memory_budget_threshold || rss_memory > rss_memory_threshold) &&
+        GetFlag(FLAGS_enable_heartbeat_eviction)) {
       uint32_t starting_segment_id = rand() % pt->GetSegmentCount();
-      db_slice.FreeMemWithEvictionStep(i, starting_segment_id,
-                                       eviction_redline - db_slice.memory_budget());
+      size_t goal_bytes = std::max(memory_budget_threshold - db_slice.memory_budget(),
+                                   rss_memory - rss_memory_threshold);
+      db_slice.FreeMemWithEvictionStep(i, starting_segment_id, goal_bytes);
     }
   }
 

@@ -120,6 +120,12 @@ void DflyCmd::ReplicaInfo::Cancel() {
     if (flow->cleanup) {
       flow->cleanup();
     }
+    // flow->cleanup() might be set when we transition to StableSync but the saver
+    // might still be active. We should clean this.
+    if (flow->saver) {
+      flow->saver->CancelInShard(shard);  // stops writing to journal stream to channel
+      flow->saver.reset();
+    }
     VLOG(2) << "After flow cleanup " << shard->shard_id();
     flow->conn = nullptr;
   });
@@ -369,7 +375,6 @@ void DflyCmd::StartStable(CmdArgList args, Transaction* tx, RedisReplyBuilder* r
 
     auto cb = [this, &status, replica_ptr = replica_ptr](EngineShard* shard) {
       FlowInfo* flow = &replica_ptr->flows[shard->shard_id()];
-
       status = StopFullSyncInThread(flow, &replica_ptr->cntx, shard);
       if (*status != OpStatus::OK) {
         return;
@@ -377,9 +382,6 @@ void DflyCmd::StartStable(CmdArgList args, Transaction* tx, RedisReplyBuilder* r
       StartStableSyncInThread(flow, &replica_ptr->cntx, shard);
     };
     shard_set->RunBlockingInParallel(std::move(cb));
-
-    if (*status != OpStatus::OK)
-      return rb->SendError(kInvalidState);
   }
 
   LOG(INFO) << "Transitioned into stable sync with replica " << replica_ptr->address << ":"
@@ -595,6 +597,7 @@ OpStatus DflyCmd::StartFullSyncInThread(FlowInfo* flow, Context* cntx, EngineSha
 
 OpStatus DflyCmd::StopFullSyncInThread(FlowInfo* flow, Context* cntx, EngineShard* shard) {
   DCHECK(shard);
+
   error_code ec = flow->saver->StopFullSyncInShard(shard);
   if (ec) {
     cntx->ReportError(ec);
@@ -697,6 +700,7 @@ void DflyCmd::BreakStalledFlowsInShard() {
     return;
 
   ShardId sid = EngineShard::tlocal()->shard_id();
+
   vector<uint32_t> deleted;
 
   for (auto [sync_id, replica_ptr] : replica_infos_) {

@@ -2360,6 +2360,7 @@ void ServerFamily::Info(CmdArgList args, Transaction* tx, SinkReplyBuilder* buil
     append("total_net_output_bytes", reply_stats.io_write_bytes);
     append("rdb_save_usec", m.coordinator_stats.rdb_save_usec);
     append("rdb_save_count", m.coordinator_stats.rdb_save_count);
+    append("big_value_preemptions", m.coordinator_stats.big_value_preemptions);
     append("instantaneous_input_kbps", -1);
     append("instantaneous_output_kbps", -1);
     append("rejected_connections", -1);

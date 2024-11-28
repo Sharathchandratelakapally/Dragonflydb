@@ -114,3 +114,74 @@ async def test_rss_oom_ratio(df_factory: DflyInstanceFactory, admin_port):
     # new client create shoud not fail after memory usage decrease
     client = df_server.client()
     await client.execute_command("set x y")
+
+
+@pytest.mark.asyncio
+@dfly_args(
+    {
+        "proactor_threads": 1,
+        "cache_mode": "true",
+        "maxmemory": "256mb",
+        "rss_oom_deny_ratio": 0.5,
+    }
+)
+async def test_cache_eviction_with_rss_deny_oom(
+    async_client: aioredis.Redis,
+    df_server: DflyInstance,
+):
+    """
+    Test to verify that cache eviction is triggered even if used memory is small but rss memory is above limit
+    """
+
+    max_memory = 256 * 1024 * 1024  # 256 MB
+    data_fill_size = int(0.25 * max_memory)  # 25% of max memory
+    rss_increase_size = int(0.3 * max_memory)  # 30% of max memory
+
+    key_size = 1024  # 1 mb
+    num_keys = data_fill_size // key_size
+
+    # Fill data to 25% of max memory
+    await async_client.execute_command("DEBUG", "POPULATE", num_keys, "key", key_size)
+
+    await asyncio.sleep(1)  # Wait for RSS heartbeat update
+
+    # First test that eviction is not triggered without connection creation
+    stats_info = await async_client.info("stats")
+    assert stats_info["evicted_keys"] == 0, "No eviction should start yet."
+
+    # Get RSS memory before creating new connections
+    memory_info = await async_client.info("memory")
+    rss_before_connections = memory_info["used_memory_rss"]
+
+    # Increase RSS memory by 30% of max memory
+    # We can simulate RSS increase by creating new connections
+    # Estimate memory per connection
+    estimated_connection_memory = 15 * 1024  # 15 KB per connection
+    num_connections = rss_increase_size // estimated_connection_memory
+    connections = []
+    for _ in range(num_connections):
+        conn = aioredis.Redis(port=df_server.port)
+        await conn.ping()
+        connections.append(conn)
+
+    await asyncio.sleep(1)  # Wait for RSS heartbeat update
+
+    # Get RSS memory after creating new connections
+    memory_info = await async_client.info("memory")
+
+    assert (
+        memory_info["used_memory"] < data_fill_size
+    ), "Used memory should be less than initial fill size due to eviction."
+
+    assert (
+        memory_info["used_memory_rss"] > rss_before_connections
+    ), "RSS memory should have increased."
+
+    # Check that eviction has occurred
+    stats_info = await async_client.info("stats")
+    assert (
+        stats_info["evicted_keys"] > 0
+    ), "Eviction should have occurred due to rss memory pressure."
+
+    for conn in connections:
+        await conn.close()
